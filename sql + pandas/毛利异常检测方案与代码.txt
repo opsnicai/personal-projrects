@@ -1,0 +1,185 @@
+"""
+    毛利异常判断
+
+异常判断：
+	箱型图中，四分位值，毛利高于某一分位值（例如0.8）或者 低于 某一 分位值（例如0.2）都算作异常
+举例：
+	区域下判断门店异常：计算门店集群下所有门店数据得出 0.25、0.75 分位值，进而得出异常数据
+    
+处理：
+	业务异常：数据从产生到提取过程中有无人为性错误。
+	数据异常：
+		判断是否为周期性异常：分析过去一段时间（7或30天）数据（横向比较）
+		偶然性异常：门店集群中门店是否也存在该异常（纵向比较）
+	根据横向和纵向比较可生成 二维 异常图
+预测：
+	仅能预测周期性异常
+    
+经过实际测试，不同类型门店、不同类型大类设置不同 分位值 较为适宜
+"""
+
+# 取毛利数据
+# 门店下大类异常 大类下商品异常
+
+import pandas as pd
+import numpy as np
+from datetime import datetime,timedelta
+from pyhive import hive
+
+
+
+class Test():
+    # 基础 sql 语句
+    basic_sql = """
+        select {select},
+            sum(a.hs_cost) hs_cost,abs(sum(a.hs_wq_amt)) as amt
+            -- 1 - sum(a.hs_cost)/abs(sum(a.hs_wq_amt)) as smmll
+        from txxxxxx.dcspf a
+            join txxxxxx.dcpd b on a.item = b.item
+            join txxxxxx.ocs c on a.store_id = c.store
+            join testdm.dm_store_type d on a.store_id = d.store_id
+            join dfs e on a.sale_type = e.sales_type_id 
+        where {where}
+        group by {select}
+    """
+    select_field = ["d.types","a.store_id,c.store_name","dept","a.item"]
+    where_field = ["d.types in ","a.store_id in ","b.dept in ","a.item in "]
+    
+    basic_where = """
+            c.region_name not like '%家电%' 
+            and a.store_id like '120%'
+            and length(c.store_close_date) = 0
+            and e.retail_type in (1,2)
+            and {limit_sql}
+            and a.cdate between {date_sql}
+            and {data_list_sql}"""
+    
+    where_store_type = """
+            select distinct a.types
+            from testdm.dm_store_type a
+            where {where_type}
+        """
+    
+    
+    def get_sale_type(self):
+        #导入data_dw.dw_cs_sales_type_dim
+        # 获取销售类型
+        conn1=hive.connect(host='10.203.18.80',port=7001,auth='LDAP',username='bbg_innovation',password='bbg_innovation_0Bo7Pj',database='data_dw')
+        cursor=conn1.cursor()
+        cursor.execute("set mapreduce.job.queuename=bbg_innovation_queue")#设置队列
+
+        sq = """
+            select a.sales_type_id sales_type_id,a.retail_type retail_type
+            from data_dw.dw_cs_sales_type_dim a
+        """
+
+        cursor.execute(sq)
+        column_list=[i[0] for i in cursor.description]
+        df=pd.DataFrame(cursor.fetchall(),columns=column_list)
+        conn1.close()
+        dfs = spark.createDataFrame(df)
+        return dfs
+    
+    def get_error(self):
+        df,df_compare,group_key = self.spark_run()
+        df["smmll"] = (df["amt"] - df["hs_cost"])/df["amt"]
+        
+        df_2575 = df.groupby([group_key])["smmll"].apply(np.percentile,[10,90])
+        df_2575.name = "quarter"
+
+        df_tmp = pd.DataFrame(df_2575).reset_index()
+        df_tmp["quarter_h"] = df_tmp["quarter"].apply(lambda x:x[1])
+        df_tmp["quarter_l"] = df_tmp["quarter"].apply(lambda x:x[0])
+        df_tmp = df_tmp.drop(columns = "quarter")
+        
+        df_new = df.merge(df_tmp,on = [group_key],how = "outer")
+        return df_new,df_new[(df["smmll"] < df_new["quarter_l"]) | (df["smmll"] > df_new["quarter_h"])]
+        
+    def spark_run(self):
+        dfs = self.get_sale_type()
+        dfs.createOrReplaceTempView("dfs")
+        # 提取 基础数据
+        full_sql,compare_sql,target_key = self.handle_data()
+        
+        group_key = target_key.split(".")[1]
+        # print(full_sql,compare_sql,group_key)
+        
+        return spark.sql(full_sql).toPandas(),spark.sql(compare_sql),group_key
+    
+    def handle_data(self):
+        data_df,date_df = self.get_input()
+        
+        # 获取最低层级下所有条目
+        index = max(data_df[data_df["data"] != 'all'].index) + 1
+        target_key  = data_df[data_df.index == index].iloc[0]["rank"]
+        
+        s = """
+            {data_key} in
+                (select distinct {data_key}
+                from {data_value})
+        """
+        data_dict = {
+            "b.dept":"txxxxxx.dcpd b",
+            "a.item":"txxxxxx.dcspf a",
+            "a.store_id":"txxxxxx.dcspf a",
+            "c.region":"txxxxxx.ocs c",
+            "c.area":"txxxxxx.ocs c"
+        }
+        data_list_sql = s.format(data_key = target_key,data_value = data_dict[target_key])
+        
+        limit_sql = " and ".join(i for i in data_df[(data_df["data"] != 'all') & (data_df.index != 1)]["where_field"])
+        
+        # 生成 select 模块和 where 模块        
+        index = max(data_df[data_df["data"] != 'all'].index) + 1
+        select = ','.join(i for i in data_df[data_df.index <= index]["select_field"])
+        where = self.basic_where.format(date_sql = ' and '.join("'"+i+"'" for i in date_df["date"]),\
+                                        limit_sql = limit_sql,data_list_sql = data_list_sql)
+        # 基础数据 生成 完整 sql 语句
+        full_sql = self.basic_sql.format(select = select,where = where)
+        
+        
+        # 横向比较 过去30天对比数据
+        where_compare = self.basic_where.format(date_sql = ' and '.join("'"+i+"'" for i in date_df["date_compare"]),\
+                                        limit_sql = limit_sql,data_list_sql = data_list_sql)
+        compare_select = [i for i in data_df[data_df.index < index]["select_field"]] + ["a.cdate"] +\
+                                            [i for i in data_df[data_df.index == index]["select_field"]]
+        select = ','.join(i for i in compare_select)
+        compare_sql = self.basic_sql.format(select = select,where = where_compare)
+        
+        
+        # 纵向比较 门店集群下所有门店  
+        
+        return full_sql,compare_sql,target_key
+
+    def get_input(self):
+        # 获取查询层级
+        rank = ["store_type","a.store_id","b.dept","a.item"]
+        data = []
+        for i in range(len(rank)):
+            inp = input(rank[i] + ":")
+            data.append(inp if inp != '' else "all")
+        
+        data_df = pd.DataFrame({"rank":rank,"data":data,"select_field":self.select_field,"where_field":self.where_field}) 
+        
+        tmp_df = pd.read_excel("./jyh/store_type.xlsx")
+        data_df.loc[0,"data"] = "'"+tmp_df[tmp_df["store_id"] ==int(data[1])].iloc[0]["types"]+"'"
+        
+        data_df["where_field"] = data_df["where_field"] + "(" + data_df["data"] + ")"
+        
+        # 获取查询日期
+        yesterday = (datetime.today() - timedelta(1)).strftime("%Y-%m-%d")
+        date_label = ["开始时间","结束时间"]
+        date = []
+        for i in range(len(date_label)):
+            inp = input(date_label[i] + "(默认昨天):")
+            date.append(inp if inp != '' else yesterday)
+        
+        date_compare = []
+        date_compare.append((datetime.strptime(date[0],"%Y-%m-%d") - timedelta(30)).strftime("%Y-%m-%d"))
+        date_compare.append(yesterday)
+        date_df = pd.DataFrame({"date_label":date_label,"date":date,"date_compare":date_compare})
+        
+        return data_df,date_df
+
+t = Test()
+df,df1 = t.get_error()

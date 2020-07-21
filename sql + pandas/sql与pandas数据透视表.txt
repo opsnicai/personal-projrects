@@ -1,0 +1,62 @@
+"""
+#数据需求：树店；调取日期：2020年7月1日-7月15日，特别注意7月10日当天营业至24点  36/37大类
+#日期	时间段	大类	销售金额	扫描毛利率	扫描毛利额
+#7:30-14:30 14:30-22:30 
+
+7月10日当天营业至24点 单独求：7:30-15:30  15:30-24:00
+"""
+
+import pandas as pd
+
+s1 = """
+    select a.store,a.storename,a.date,a.t,a.dep,
+        sum(a.amt) as amt,
+        1 - sum(a.cost)/abs(sum(a.amt)) as smmll,
+        sum(a.amt - a.cost) as smmle
+    from
+        (select a.store,c.storename,a.date,
+            case when substr(a.tdatetime,12,5) between '07:30' and '14:29' then 't1'
+                else 't2'
+            end as t,
+            b.dep,a.amt,a.cost
+        from dba a 
+            join dbsp b on a.item = b.item
+            join dbo c on a.store = c.store
+        where a.store = 120548
+            and substr(a.tdatetime,12,5) between '07:30' and '22:30'
+            and (a.date between '2020-07-01' and '2020-07-09' or a.date between '2020-07-11' and '2020-07-15')
+            and b.dep in (36,37)
+        )a
+    group by a.store,a.storename,a.date,a.t,a.dep
+    order by a.store,a.date,a.t,a.dep
+"""
+df1 = spark.sql(s1).toPandas()
+
+s2 = """
+    select a.store,a.store_name,a.cdate,a.t,a.dep,
+        sum(a.amt) as amt,
+        1 - sum(a.cost)/abs(sum(a.amt)) as smmll,
+        sum(a.amt - a.cost) as smmle
+    from
+        (select a.store,c.store_name,a.cdate,
+            case when substr(a.tdatetime,12,5) between '07:30' and '15:29' then 't1'
+                else 't2'
+            end as t,
+            b.dep,a.amt,a.cost
+        from dba a 
+            join dbsp b on a.item = b.item
+            join dbo c on a.store = c.store
+        where a.store = 120548
+            and substr(a.tdatetime,12,5) between '07:30' and '23:59'
+            and a.cdate = '2020-07-10'
+            and b.dep in (36,37)
+        )a
+    group by a.store,a.store_name,a.cdate,a.t,a.dep
+    order by a.store,a.cdate,a.t,a.dep
+"""
+df2 = spark.sql(s2).toPandas()
+
+df = pd.concat([df1,df2]).sort_values(["date","t","dep"])
+
+df.pivot_table(values = ["amt","smmll","smmle"],\
+                        index = ["store_name","cdate","t"],columns = ["dep"]).swaplevel(axis = 1).sort_index(axis = 1)
